@@ -36,17 +36,93 @@ class MultiModalHospitalAnalyzer:
         self.yolo_model = YOLO('yolov8n.pt')  # Main detection model
         # Could add specialized models: yolov8s-seg.pt for segmentation, custom trained models
         
+    def stac_client_fetcher(self, lon: float, lat: float) -> Optional[Dict[str, str]]:
+        """
+        Fetches the latest cloud-free Sentinel-2 image for the given coordinates
+        using the Planetary Computer STAC API.
+
+        Returns:
+            A dictionary mapping required band names (B4, B8, B10) to local file paths,
+            or None if no suitable image is found.
+        """
+        print(f"-> Searching STAC for imagery near ({lon:.4f}, {lat:.4f})...")
+        
+        # Define search area (bounding box around the hospital)
+        buffer = 0.005  # A small buffer for a 500m x 500m area roughly
+        bbox = [lon - buffer, lat - buffer, lon + buffer, lat + buffer]
+        
+        # Connect to Planetary Computer STAC API
+        STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+        catalog = Client.open(STAC_URL, headers=pc.sign_headers())
+
+        # Define search parameters
+        search = catalog.search(
+            collections=["sentinel-2-l2a"],
+            bbox=bbox,
+            datetime=(datetime.now() - timedelta(days=30)).isoformat() + '/',
+            query={"eo:cloud_cover": {"lt": 10}}, # Only get images with < 10% cloud cover
+            limit=10
+        )
+        
+        items = list(search.get_items())
+        
+        if not items:
+            print("❌ No recent, low-cloud-cover Sentinel-2 imagery found.")
+            return None
+
+        # Sort by least cloud cover and get the best item
+        best_item = sorted(items, key=lambda item: item.properties.get("eo:cloud_cover", 100))[0]
+        
+        # Required bands for analysis (B4: Red, B8: NIR, B10: Thermal/SWIR proxy)
+        required_bands = ["B4", "B8", "B10"]
+        downloaded_paths = {}
+
+        # Download the required assets (Bands)
+        for band in required_bands:
+            if band in best_item.assets:
+                asset_href = best_item.assets[band].href
+                
+                # Sign the URL for access
+                signed_href = pc.sign(asset_href)
+
+                # Use rasterio to read a window of the image directly from the URL
+                try:
+                    with rasterio.open(signed_href) as src:
+                        # Convert bounds to a window for efficient reading
+                        window = from_bounds(*bbox, src.transform)
+                        data = src.read(1, window=window)
+                        
+                        # Save the small data array as a local temporary file
+                        temp_path = f"temp_band_{band}_{int(lat*1000)}_{int(lon*1000)}.tif"
+                        profile = src.profile
+                        profile.update(
+                            width=data.shape[1], 
+                            height=data.shape[0], 
+                            transform=src.window_transform(window),
+                            dtype=data.dtype,
+                            count=1
+                        )
+                        
+                        with rasterio.open(temp_path, 'w', **profile) as dst:
+                            dst.write(data, 1)
+                            
+                        downloaded_paths[band] = temp_path
+                except Exception as e:
+                    print(f"Error processing band {band}: {e}")
+                    # Clean up any partial files and return None
+                    for p in downloaded_paths.values(): 
+                        if os.path.exists(p): os.remove(p)
+                    return None
+
+        return downloaded_paths if len(downloaded_paths) == len(required_bands) else None
+        
     def multi_spectral_analysis(self, imagery_paths: Dict[str, str], hospital_coords: Tuple[float, float]) -> Dict:
         """
-        Analyze multiple spectral bands for comprehensive environmental assessment
-        
-        Args:
-            imagery_paths: Dict mapping band names to file paths
-            hospital_coords: (lat, lon) of hospital
-        
-        Returns:
-            Dict with multi-spectral analysis results
+        Analyze multiple spectral bands for comprehensive environmental assessment.
+        Calculates real NDVI and proxies for Urban Heat if imagery_paths is provided.
         """
+        print("-> Performing Multi-Spectral Analysis...")
+        
         results = {
             'vegetation_health': None,
             'urban_heat_island': None,
@@ -55,38 +131,58 @@ class MultiModalHospitalAnalyzer:
             'change_detection': None
         }
         
+        # --- Fallback to Simulation if real data fetch failed or is incomplete ---
+        if not imagery_paths or "B4" not in imagery_paths or "B8" not in imagery_paths or "B10" not in imagery_paths:
+            print("⚠️ Imagery paths incomplete. Falling back to simulated spectral data.")
+            return {
+                'vegetation_health': np.random.uniform(0.2, 0.8),
+                'urban_heat_island': np.random.uniform(25, 35),
+                'water_stress': np.random.uniform(0.1, 0.6),
+                'air_quality_proxy': np.random.uniform(0.3, 0.9)
+            }
+        # ------------------------------------------------------------------------
+        
         try:
-            # NDVI calculation (vegetation health)
-            if 'red' in imagery_paths and 'nir' in imagery_paths:
-                with rasterio.open(imagery_paths['red']) as red_src:
-                    with rasterio.open(imagery_paths['nir']) as nir_src:
-                        red_data = red_src.read(1).astype(float)
-                        nir_data = nir_src.read(1).astype(float)
-                        
-                        # Calculate NDVI
-                        ndvi = (nir_data - red_data) / (nir_data + red_data + 1e-10)
-                        results['vegetation_health'] = float(np.nanmean(ndvi))
-            
-            # Thermal analysis for urban heat island effect
-            if 'thermal' in imagery_paths:
-                with rasterio.open(imagery_paths['thermal']) as thermal_src:
-                    thermal_data = thermal_src.read(1)
-                    results['urban_heat_island'] = float(np.mean(thermal_data))
-            
-            # Water stress indicators (using SWIR bands)
-            if 'swir1' in imagery_paths and 'swir2' in imagery_paths:
-                with rasterio.open(imagery_paths['swir1']) as swir1_src:
-                    with rasterio.open(imagery_paths['swir2']) as swir2_src:
-                        swir1_data = swir1_src.read(1).astype(float)
-                        swir2_data = swir2_src.read(1).astype(float)
-                        
-                        # Simple water stress index
-                        water_index = (swir1_data - swir2_data) / (swir1_data + swir2_data + 1e-10)
-                        results['water_stress'] = float(np.nanmean(water_index))
+            # 1. Calculate NDVI (Normalized Difference Vegetation Index)
+            # NDVI = (NIR - Red) / (NIR + Red) -> (B8 - B4) / (B8 + B4)
+            with rasterio.open(imagery_paths["B8"]) as nir_src, rasterio.open(imagery_paths["B4"]) as red_src:
+                nir = nir_src.read(1).astype(float)
+                red = red_src.read(1).astype(float)
+                
+                # Avoid division by zero
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    ndvi = (nir - red) / (nir + red)
+                
+                # Use a masked mean to ignore NoData values/NaNs
+                ndvi_mean = np.nanmean(ndvi)
+                results['vegetation_health'] = float(ndvi_mean)
+                
+            # 2. Estimate Urban Heat (using B10 as a proxy for surface temperature)
+            # Sentinel-2 B10 is SWIR band. We use the mean Digital Number (DN) as a proxy for heat.
+            with rasterio.open(imagery_paths["B10"]) as thermal_src:
+                thermal_data = thermal_src.read(1).astype(float)
+                heat_proxy_mean = np.nanmean(thermal_data)
+                results['urban_heat_island'] = float(heat_proxy_mean)
+                
+            # 3. Water stress and Air Quality Proxy remain simulated for simplicity
+            results['water_stress'] = np.random.uniform(0.1, 0.6)
+            results['air_quality_proxy'] = np.random.uniform(0.3, 0.9)
             
         except Exception as e:
-            print(f"Multi-spectral analysis error: {e}")
-            
+            print(f"⚠️ Error during multi-spectral analysis: {e}. Falling back to partial/simulated data.")
+            # Set all results to simulated data if a fatal error occurred during processing
+            results = {
+                'vegetation_health': np.random.uniform(0.2, 0.8),
+                'urban_heat_island': np.random.uniform(25, 35),
+                'water_stress': np.random.uniform(0.1, 0.6),
+                'air_quality_proxy': np.random.uniform(0.3, 0.9)
+            }
+
+        # Clean up the temporary files after reading
+        for path in imagery_paths.values():
+            if os.path.exists(path):
+                os.remove(path)
+                
         return results
     
     def temporal_analysis(self, hospital_id: str, current_data: Dict, days_back: int = 30) -> Dict:
@@ -437,10 +533,11 @@ def run_enhanced_pipeline_demo():
     for idx, hospital in gdf_hosp.iterrows():
         hospital_id = str(hospital['hospital_id'])
         coords = (hospital['latitude'], hospital['longitude'])
+        lon, lat = hospital['longitude'], hospital['latitude'] # Get separate lon/lat variables
         
         print(f"\n🏥 Processing Hospital {hospital_id}: {hospital.get('hospital_name', 'Unknown')}")
         
-        # Simulate image analysis (in production, this would use real imagery)
+        # 1. Image Analysis (Placeholder image used for YOLO, will not match spectral data)
         print("  📸 Running enhanced image analysis...")
         # For demo, create a simple test image
         test_img = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
@@ -452,21 +549,23 @@ def run_enhanced_pipeline_demo():
         # Clean up temp file
         if os.path.exists(test_img_path):
             os.remove(test_img_path)
+            
+        # 2. Multi-spectral analysis (REAL STAC FETCH)
+        print("  🛰️ Performing multi-spectral analysis (fetching real data)...")
+        # New Step: Fetch real satellite data paths
+        imagery_paths = analyzer.stac_client_fetcher(lon, lat)
         
-        # Multi-spectral analysis (simulated)
-        print("  🛰️ Performing multi-spectral analysis...")
-        multispectral_results = {
-            'vegetation_health': np.random.uniform(0.2, 0.8),
-            'urban_heat_island': np.random.uniform(25, 35),
-            'water_stress': np.random.uniform(0.1, 0.6),
-            'air_quality_proxy': np.random.uniform(0.3, 0.9)
-        }
+        # Pass the real file paths to the spectral analysis function
+        multispectral_results = analyzer.multi_spectral_analysis(
+            imagery_paths=imagery_paths,
+            hospital_coords=coords
+        )
         
-        # Environmental data integration
+        # 3. Environmental data integration
         print("  🌍 Integrating environmental data...")
         environmental_data = analyzer.environmental_data_integration(coords)
         
-        # Temporal analysis
+        # Temporal analysis (uses image analysis results)
         print("  📈 Analyzing temporal patterns...")
         current_data = {
             'vehicle_count': imagery_results.get('vehicle_count', 0),
@@ -542,6 +641,8 @@ def run_enhanced_pipeline_demo():
             <b>Environmental:</b><br>
             • Air Quality: {report['analysis_summary']['air_quality_status']}<br>
             • Risk Level: {report['analysis_summary']['environmental_risk']}<br>
+            • Vegetation Health (NDVI): {report['multispectral'].get('vegetation_health', 'N/A'):.2f}<br>
+            • Urban Heat Proxy (DN): {report['multispectral'].get('urban_heat_island', 'N/A'):.2f}<br>
             <br>
             <b>Analysis Quality:</b><br>
             • Confidence: {confidence:.0%}<br>
@@ -610,3 +711,4 @@ def run_enhanced_pipeline_demo():
 if __name__ == "__main__":
     # Run the enhanced pipeline
     results = run_enhanced_pipeline_demo()
+}
