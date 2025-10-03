@@ -1,0 +1,4 @@
+disasterNumber,state,incidentType,title,severity,confidence,FEMA_Action_Level,EMS_Activated
+4583,CA,Volcano,Kilauea Volcano Eruption,,0.55,Monitor,NO
+evt-12345,CA,Wildfire,Wildfire in Northern CA,7.8,0.95,Deploy,YES
+usgs-001,AK,Earthquake,6.1 Earthquake near Anchorage,Severe,0.88,Pre-Position,YES
