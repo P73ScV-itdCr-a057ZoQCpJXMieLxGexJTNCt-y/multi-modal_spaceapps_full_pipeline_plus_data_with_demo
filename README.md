@@ -1,1 +1,2 @@
-python fixed_multimodal_spaceapps.py
+AI_Disaster_Response_Agent_featuring_(Autonomous_Ops)_featuring_AWS
+MIT open source license
